@@ -683,6 +683,15 @@ WAIT_PHRASES = parse_comma_list("VOICEMODE_WAIT_PHRASES", "wait")
 # Wait duration in seconds when wait phrase is detected
 WAIT_DURATION = float(os.getenv("VOICEMODE_WAIT_DURATION", "60.0"))  # Default 60s (1 minute)
 
+# End phrase detection for continuous listen mode
+# When listen_mode="continuous", these phrases end the user's turn
+END_PHRASES = parse_comma_list("VOICEMODE_END_PHRASES", "over and out,I'm done,that's all,that is all")
+
+# Safety margin before tool timeout for auto-continuation (seconds)
+# The tool will stop recording this many seconds before the timeout deadline
+# to allow time for final transcription and response formatting
+TIMEOUT_SAFETY_MARGIN = float(os.getenv("VOICEMODE_TIMEOUT_SAFETY_MARGIN", "12"))
+
 # Audio feedback chime configuration
 # Leading silence before chimes to allow Bluetooth devices to wake up
 CHIME_LEADING_SILENCE = float(os.getenv("VOICEMODE_CHIME_LEADING_SILENCE", "0.1"))  # Default 0.1s - minimal delay for Bluetooth

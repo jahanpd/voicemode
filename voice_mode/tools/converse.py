@@ -3,9 +3,13 @@
 import asyncio
 import logging
 import os
+import queue
+import string
+import threading
 import time
 import traceback
-from typing import Optional, Literal, Tuple, Dict, Union
+import uuid
+from typing import Optional, Literal, Tuple, Dict, Union, List
 from pathlib import Path
 from datetime import datetime
 
@@ -63,7 +67,9 @@ from voice_mode.config import (
     MP3_BITRATE,
     CONCH_ENABLED,
     CONCH_TIMEOUT,
-    CONCH_CHECK_INTERVAL
+    CONCH_CHECK_INTERVAL,
+    END_PHRASES,
+    TIMEOUT_SAFETY_MARGIN
 )
 import voice_mode.config
 from voice_mode.provider_discovery import provider_registry
@@ -1072,6 +1078,428 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
         # For fallback, assume speech is present since we can't detect
         return (record_audio(max_duration), True)
 
+
+# ==================== SESSION MANAGEMENT ====================
+# Stores state for auto-continuation across tool calls when timeout approaches
+
+_active_sessions: Dict[str, dict] = {}
+_SESSION_EXPIRY_SECONDS = 120  # Sessions expire after 2 minutes of inactivity
+
+
+def _create_session(
+    listen_mode: str,
+    end_phrases: List[str],
+    vad_aggressiveness: Optional[int],
+    listen_duration_max: float,
+    listen_duration_min: float,
+) -> str:
+    """Create a new continuous listen session and return its ID."""
+    _cleanup_expired_sessions()
+    session_id = uuid.uuid4().hex[:12]
+    _active_sessions[session_id] = {
+        "transcript_segments": [],
+        "total_recording_time": 0.0,
+        "started_at": time.time(),
+        "last_active": time.time(),
+        "listen_mode": listen_mode,
+        "end_phrases": end_phrases,
+        "vad_aggressiveness": vad_aggressiveness,
+        "listen_duration_max": listen_duration_max,
+        "listen_duration_min": listen_duration_min,
+    }
+    logger.info(f"Created continuous listen session {session_id}")
+    return session_id
+
+
+def _get_session(session_id: str) -> Optional[dict]:
+    """Retrieve a session by ID, or None if expired/missing."""
+    _cleanup_expired_sessions()
+    session = _active_sessions.get(session_id)
+    if session:
+        session["last_active"] = time.time()
+    return session
+
+
+def _close_session(session_id: str) -> Optional[dict]:
+    """Remove and return a session."""
+    return _active_sessions.pop(session_id, None)
+
+
+def _cleanup_expired_sessions():
+    """Remove sessions that have been inactive too long."""
+    now = time.time()
+    expired = [
+        sid for sid, s in _active_sessions.items()
+        if now - s["last_active"] > _SESSION_EXPIRY_SECONDS
+    ]
+    for sid in expired:
+        logger.info(f"Expired continuous listen session {sid}")
+        del _active_sessions[sid]
+
+
+def _check_end_phrase(text: str, end_phrases: List[str]) -> Tuple[bool, str]:
+    """Check if text ends with an end phrase. Returns (matched, cleaned_text)."""
+    if not text:
+        return False, text
+    normalized = text.lower().strip().rstrip(string.punctuation).strip()
+    for phrase in end_phrases:
+        if normalized.endswith(phrase.lower().strip()):
+            logger.info(f"End phrase detected: '{phrase}' in '{text}'")
+            # Strip the end phrase from the text
+            # Find where the phrase starts in the original (case-insensitive)
+            idx = normalized.rfind(phrase.lower().strip())
+            if idx > 0:
+                cleaned = text[:idx].rstrip(" ,.-;:").strip()
+            else:
+                cleaned = ""
+            return True, cleaned
+    return False, text
+
+
+# ==================== CONTINUOUS RECORDING ====================
+
+
+def _continuous_recording_worker(
+    max_duration: float,
+    min_segment_duration: float,
+    vad_aggressiveness: Optional[int],
+    segment_queue: queue.Queue,
+    stop_event: threading.Event,
+    abort_time: float,
+) -> None:
+    """Record audio continuously, yielding segments on silence boundaries.
+
+    Runs in a worker thread. Puts (segment_audio, segment_duration) tuples into
+    segment_queue when silence is detected after speech. Puts None sentinel when done.
+
+    Args:
+        max_duration: Maximum total recording duration in seconds.
+        min_segment_duration: Minimum speech duration before a silence counts as
+            a segment boundary.
+        vad_aggressiveness: VAD aggressiveness level (0-3). None uses default.
+        segment_queue: Queue to put completed audio segments into.
+        stop_event: Set by the async orchestrator to signal recording should stop
+            at the next silence boundary.
+        abort_time: Wall-clock time (time.time()) by which we must stop to avoid
+            tool timeout. We stop at next silence boundary after this time.
+    """
+    import sys
+
+    if not VAD_AVAILABLE:
+        logger.warning("webrtcvad not available, falling back to fixed recording for continuous mode")
+        audio = record_audio(min(max_duration, abort_time - time.time()))
+        if len(audio) > 0:
+            segment_queue.put((audio, len(audio) / SAMPLE_RATE))
+        segment_queue.put(None)  # sentinel
+        return
+
+    effective_vad = vad_aggressiveness if vad_aggressiveness is not None else VAD_AGGRESSIVENESS
+    vad = webrtcvad.Vad(effective_vad)
+
+    chunk_samples = int(SAMPLE_RATE * VAD_CHUNK_DURATION_MS / 1000)
+    chunk_duration_s = VAD_CHUNK_DURATION_MS / 1000
+    vad_sample_rate = 16000
+    vad_chunk_samples = int(vad_sample_rate * VAD_CHUNK_DURATION_MS / 1000)
+
+    # Per-segment state
+    current_segment_chunks: List[np.ndarray] = []
+    segment_duration = 0.0
+    silence_duration_ms = 0
+    speech_detected_in_segment = False
+
+    # Global state
+    total_duration = 0.0
+    audio_q: queue.Queue = queue.Queue()
+
+    original_stdin = sys.stdin
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+
+    def audio_callback(indata, frames, time_info, status):
+        if status:
+            logger.warning(f"Audio stream status: {status}")
+            status_str = str(status).lower()
+            if any(err in status_str for err in ['device unavailable', 'device disconnected',
+                                                    'invalid device', 'unanticipated host error',
+                                                    'stream is stopped', 'portaudio error']):
+                audio_q.put(None)
+                return
+        audio_q.put(indata.copy())
+
+    try:
+        with sd.InputStream(samplerate=SAMPLE_RATE,
+                           channels=CHANNELS,
+                           dtype=np.int16,
+                           callback=audio_callback,
+                           blocksize=chunk_samples):
+
+            logger.debug("Continuous recording: started audio stream")
+
+            while total_duration < max_duration and not stop_event.is_set():
+                try:
+                    chunk = audio_q.get(timeout=0.1)
+                except queue.Empty:
+                    # Check if we need to abort due to timeout
+                    if time.time() >= abort_time:
+                        logger.info("Continuous recording: approaching timeout, stopping")
+                        break
+                    continue
+
+                if chunk is None:
+                    logger.error("Audio device error in continuous recording")
+                    break
+
+                chunk_flat = chunk.flatten()
+                current_segment_chunks.append(chunk_flat)
+                segment_duration += chunk_duration_s
+                total_duration += chunk_duration_s
+
+                # Downsample for VAD
+                from scipy import signal as scipy_signal
+                resampled_length = int(len(chunk_flat) * vad_sample_rate / SAMPLE_RATE)
+                vad_chunk = scipy_signal.resample(chunk_flat, resampled_length)
+                vad_chunk = vad_chunk[:vad_chunk_samples].astype(np.int16)
+                chunk_bytes = vad_chunk.tobytes()
+
+                try:
+                    is_speech = vad.is_speech(chunk_bytes, vad_sample_rate)
+                except Exception:
+                    is_speech = True
+
+                if is_speech:
+                    speech_detected_in_segment = True
+                    silence_duration_ms = 0
+                elif speech_detected_in_segment:
+                    silence_duration_ms += VAD_CHUNK_DURATION_MS
+
+                    # Silence after speech — segment boundary
+                    if (segment_duration >= min_segment_duration
+                            and silence_duration_ms >= SILENCE_THRESHOLD_MS):
+                        logger.info(
+                            f"Continuous recording: segment boundary at {total_duration:.1f}s "
+                            f"(segment {segment_duration:.1f}s)"
+                        )
+                        # Emit this segment
+                        if current_segment_chunks:
+                            seg_audio = np.concatenate(current_segment_chunks)
+                            segment_queue.put((seg_audio, segment_duration))
+
+                        # Reset for next segment
+                        current_segment_chunks = []
+                        segment_duration = 0.0
+                        silence_duration_ms = 0
+                        speech_detected_in_segment = False
+
+                        # Check if we should stop (stop_event or timeout approaching)
+                        if stop_event.is_set():
+                            logger.info("Continuous recording: stop_event set, ending")
+                            break
+                        if time.time() >= abort_time:
+                            logger.info("Continuous recording: timeout approaching, ending")
+                            break
+
+                # Check hard timeout mid-chunk (even without silence boundary)
+                if time.time() >= abort_time:
+                    logger.info("Continuous recording: hard abort time reached")
+                    break
+
+        # Flush any remaining audio as a final segment
+        if current_segment_chunks:
+            seg_audio = np.concatenate(current_segment_chunks)
+            if speech_detected_in_segment:
+                segment_queue.put((seg_audio, segment_duration))
+                logger.info(f"Continuous recording: flushed final segment ({segment_duration:.1f}s)")
+            else:
+                logger.info("Continuous recording: discarding final segment (no speech)")
+
+    except Exception as e:
+        logger.error(f"Continuous recording error: {e}")
+        # Flush what we have
+        if current_segment_chunks:
+            seg_audio = np.concatenate(current_segment_chunks)
+            segment_queue.put((seg_audio, segment_duration))
+    finally:
+        # Always send sentinel
+        segment_queue.put(None)
+        # Restore stdio
+        if sys.stdin != original_stdin:
+            sys.stdin = original_stdin
+        if sys.stdout != original_stdout:
+            sys.stdout = original_stdout
+        if sys.stderr != original_stderr:
+            sys.stderr = original_stderr
+        logger.info(f"Continuous recording: worker finished (total {total_duration:.1f}s)")
+
+
+async def _run_continuous_listen(
+    timeout_deadline: float,
+    listen_duration_max: float,
+    listen_duration_min: float,
+    vad_aggressiveness: Optional[int],
+    end_phrases: List[str],
+    session: Optional[dict] = None,
+) -> dict:
+    """Orchestrate continuous listening with incremental transcription.
+
+    Runs the recording worker in a thread and transcribes segments as they
+    arrive at natural silence boundaries. Checks for end phrases after each
+    transcription.
+
+    Args:
+        timeout_deadline: Wall-clock time by which we must return.
+        listen_duration_max: Maximum recording duration.
+        listen_duration_min: Minimum segment duration before silence counts.
+        vad_aggressiveness: VAD aggressiveness (0-3).
+        end_phrases: Phrases that end the turn.
+        session: Existing session dict to resume, or None for new.
+
+    Returns:
+        dict with keys:
+            - transcript_segments: list of transcribed text segments
+            - total_recording_time: total seconds recorded
+            - ended_by: "end_phrase" | "max_duration" | "timeout" | "silence"
+            - end_phrase_matched: the matched phrase or None
+    """
+    seg_queue: queue.Queue = queue.Queue()
+    stop_event = threading.Event()
+
+    # Calculate abort time: leave safety margin for final transcription + return
+    abort_time = timeout_deadline - 3.0  # 3s buffer for final STT + formatting
+
+    # Account for prior recording time from resumed session
+    prior_time = session["total_recording_time"] if session else 0.0
+    remaining_duration = listen_duration_max - prior_time
+
+    if remaining_duration <= 0:
+        return {
+            "transcript_segments": session["transcript_segments"] if session else [],
+            "total_recording_time": prior_time,
+            "ended_by": "max_duration",
+            "end_phrase_matched": None,
+        }
+
+    transcript_segments: List[str] = list(session["transcript_segments"]) if session else []
+    total_recording_time = prior_time
+    ended_by = "timeout"  # default if we run out of time
+    end_phrase_matched = None
+
+    loop = asyncio.get_event_loop()
+
+    # Start the recording worker in a thread
+    worker_future = loop.run_in_executor(
+        None,
+        _continuous_recording_worker,
+        remaining_duration,
+        listen_duration_min,
+        vad_aggressiveness,
+        seg_queue,
+        stop_event,
+        abort_time,
+    )
+
+    try:
+        while True:
+            # Poll for segments from the recording worker
+            try:
+                segment = seg_queue.get_nowait()
+            except queue.Empty:
+                # Check if worker is done
+                if worker_future.done():
+                    # Drain remaining segments
+                    while True:
+                        try:
+                            segment = seg_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        if segment is None:
+                            break
+                        seg_audio, seg_duration = segment
+                        total_recording_time += seg_duration
+                        stt_result = await speech_to_text(
+                            seg_audio, SAVE_AUDIO, AUDIO_DIR if SAVE_AUDIO else None, "local"
+                        )
+                        if isinstance(stt_result, dict) and stt_result.get("text"):
+                            text = stt_result["text"]
+                            matched, cleaned = _check_end_phrase(text, end_phrases)
+                            if cleaned:
+                                transcript_segments.append(cleaned)
+                            if matched:
+                                ended_by = "end_phrase"
+                                end_phrase_matched = text
+                    # If we haven't already found an end phrase, determine why we stopped
+                    if ended_by != "end_phrase":
+                        if total_recording_time >= listen_duration_max:
+                            ended_by = "max_duration"
+                        elif time.time() >= timeout_deadline - 5.0:
+                            ended_by = "timeout"
+                        else:
+                            ended_by = "silence"
+                    break
+                await asyncio.sleep(0.05)
+                continue
+
+            # Sentinel — worker is done
+            if segment is None:
+                if ended_by != "end_phrase":
+                    if total_recording_time >= listen_duration_max:
+                        ended_by = "max_duration"
+                    elif time.time() >= timeout_deadline - 5.0:
+                        ended_by = "timeout"
+                    else:
+                        ended_by = "silence"
+                break
+
+            seg_audio, seg_duration = segment
+            total_recording_time += seg_duration
+
+            # Transcribe this segment
+            logger.info(f"Continuous listen: transcribing segment ({seg_duration:.1f}s)")
+            stt_result = await speech_to_text(
+                seg_audio, SAVE_AUDIO, AUDIO_DIR if SAVE_AUDIO else None, "local"
+            )
+
+            if isinstance(stt_result, dict) and stt_result.get("text"):
+                text = stt_result["text"]
+                logger.info(f"Continuous listen: segment transcript: '{text[:80]}...' " if len(text) > 80 else f"Continuous listen: segment transcript: '{text}'")
+
+                # Check for end phrase
+                matched, cleaned = _check_end_phrase(text, end_phrases)
+                if cleaned:
+                    transcript_segments.append(cleaned)
+                if matched:
+                    ended_by = "end_phrase"
+                    end_phrase_matched = text
+                    stop_event.set()  # Signal worker to stop
+                    break
+            else:
+                logger.info("Continuous listen: segment had no speech")
+
+            # Check timeout
+            if time.time() >= timeout_deadline - 5.0:
+                logger.info("Continuous listen: approaching timeout, signaling stop")
+                stop_event.set()
+                ended_by = "timeout"
+                # Don't break — let the worker flush its remaining segment
+
+    except Exception as e:
+        logger.error(f"Continuous listen error: {e}")
+        stop_event.set()
+        ended_by = "timeout"
+    finally:
+        stop_event.set()  # Ensure worker stops
+        try:
+            await asyncio.wait_for(worker_future, timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.warning("Continuous recording worker did not stop in time")
+
+    return {
+        "transcript_segments": transcript_segments,
+        "total_recording_time": total_recording_time,
+        "ended_by": ended_by,
+        "end_phrase_matched": end_phrase_matched,
+    }
+
+
 @mcp.tool()
 async def converse(
     message: str,
@@ -1092,7 +1520,10 @@ async def converse(
     chime_leading_silence: Optional[float] = None,
     chime_trailing_silence: Optional[float] = None,
     metrics_level: Optional[Literal["minimal", "summary", "verbose"]] = None,
-    wait_for_conch: Union[bool, str] = False
+    wait_for_conch: Union[bool, str] = False,
+    listen_mode: Optional[Literal["auto", "continuous"]] = None,
+    session_id: Optional[str] = None,
+    end_phrases: Optional[str] = None
 ) -> str:
     """Have an ongoing voice conversation - speak a message and optionally listen for response.
 
@@ -1137,6 +1568,23 @@ KEY PARAMETERS:
   - false: If another agent is speaking, return status immediately
   - true: Wait until the other agent finishes, then speak
 
+CONTINUOUS LISTEN MODE:
+  For long-form speech that spans multiple pauses (dictation, explanations, etc.)
+• listen_mode ("auto"|"continuous", default: "auto"): Controls turn-ending behavior
+  - auto: Silence ends the turn (current default behavior)
+  - continuous: Silence triggers transcription but recording continues.
+    Turn ends when an end phrase is spoken, max duration is reached,
+    or the tool approaches its timeout (auto-continuation via session_id).
+    Audio is transcribed incrementally at natural pause boundaries,
+    so no audio is ever cut mid-speech.
+• session_id (string): For resuming a continuous listen across tool calls.
+  When the tool returns with status "listening", call again with the
+  returned session_id to continue. Set skip_tts=true and message=""
+  when resuming. The tool handles concatenation of all segments.
+• end_phrases (string): Comma-separated phrases that end a continuous listen
+  turn (default: "over and out,I'm done,that's all,that is all").
+  Configurable via VOICEMODE_END_PHRASES env var.
+
 TIMING PARAMETERS (usually leave at defaults):
   Silence detection handles most cases automatically. Only override these if
   silence detection is disabled or the user reports being cut off.
@@ -1164,6 +1612,29 @@ consult the MCP resources listed above.
         skip_tts = skip_tts.lower() in ('true', '1', 'yes', 'on')
     if isinstance(wait_for_conch, str):
         wait_for_conch = wait_for_conch.lower() in ('true', '1', 'yes', 'on')
+
+    # Parse listen_mode and end_phrases
+    effective_listen_mode = listen_mode or "auto"
+    effective_end_phrases = (
+        [p.strip() for p in end_phrases.split(",") if p.strip()]
+        if end_phrases
+        else list(END_PHRASES)
+    )
+
+    # If resuming a session, restore settings from it
+    resumed_session = None
+    if session_id:
+        resumed_session = _get_session(session_id)
+        if not resumed_session:
+            return f"Error: Session '{session_id}' not found or expired. Start a new continuous listen."
+        # Restore session settings
+        effective_listen_mode = resumed_session["listen_mode"]
+        effective_end_phrases = resumed_session["end_phrases"]
+        if vad_aggressiveness is None:
+            vad_aggressiveness = resumed_session["vad_aggressiveness"]
+        listen_duration_max = resumed_session["listen_duration_max"]
+        listen_duration_min = resumed_session["listen_duration_min"]
+        logger.info(f"Resuming session {session_id} with {len(resumed_session['transcript_segments'])} prior segments, {resumed_session['total_recording_time']:.1f}s recorded")
 
     # Convert vad_aggressiveness to integer if provided as string
     if vad_aggressiveness is not None and isinstance(vad_aggressiveness, str):
@@ -1484,9 +1955,208 @@ consult the MCP resources listed above.
                     logger.info(f"Speak-only result: {result}")
                     return result
 
+                # ==================== CONTINUOUS LISTEN MODE ====================
+                if effective_listen_mode == "continuous":
+                    # Brief pause before listening (skip if resuming)
+                    if not resumed_session:
+                        await asyncio.sleep(0.5)
+
+                    # Play "listening" feedback sound
+                    await play_audio_feedback(
+                        "listening",
+                        openai_clients,
+                        chime_enabled,
+                        "whisper",
+                        chime_leading_silence=chime_leading_silence,
+                        chime_trailing_silence=chime_trailing_silence
+                    )
+
+                    logger.info(f"🎤 Continuous listen mode: listening (end phrases: {effective_end_phrases})")
+
+                    if event_logger:
+                        event_logger.log_event(event_logger.RECORDING_START, {
+                            "listen_mode": "continuous",
+                            "session_id": session_id,
+                        })
+
+                    record_start = time.perf_counter()
+                    timeout_deadline = time.time() + timeout - TIMEOUT_SAFETY_MARGIN
+                    continuous_result = await _run_continuous_listen(
+                        timeout_deadline=timeout_deadline,
+                        listen_duration_max=listen_duration_max,
+                        listen_duration_min=listen_duration_min,
+                        vad_aggressiveness=vad_aggressiveness,
+                        end_phrases=effective_end_phrases,
+                        session=resumed_session,
+                    )
+                    timings['record'] = time.perf_counter() - record_start
+
+                    # Play "finished" feedback sound
+                    await play_audio_feedback(
+                        "finished",
+                        openai_clients,
+                        chime_enabled,
+                        "whisper",
+                        chime_leading_silence=chime_leading_silence,
+                        chime_trailing_silence=chime_trailing_silence
+                    )
+
+                    if event_logger:
+                        event_logger.log_event(event_logger.RECORDING_END, {
+                            "duration": timings['record'],
+                            "listen_mode": "continuous",
+                            "ended_by": continuous_result["ended_by"],
+                            "segments": len(continuous_result["transcript_segments"]),
+                        })
+
+                    # Build the full transcript
+                    all_segments = continuous_result["transcript_segments"]
+                    total_rec_time = continuous_result["total_recording_time"]
+                    ended_by = continuous_result["ended_by"]
+
+                    # Close the resumed session if it exists
+                    if session_id:
+                        _close_session(session_id)
+
+                    # If ended by timeout, create a continuation session
+                    if ended_by == "timeout" and all_segments:
+                        new_session_id = _create_session(
+                            listen_mode=effective_listen_mode,
+                            end_phrases=effective_end_phrases,
+                            vad_aggressiveness=vad_aggressiveness,
+                            listen_duration_max=listen_duration_max,
+                            listen_duration_min=listen_duration_min,
+                        )
+                        new_session = _get_session(new_session_id)
+                        new_session["transcript_segments"] = list(all_segments)
+                        new_session["total_recording_time"] = total_rec_time
+
+                        partial_transcript = " ".join(all_segments)
+                        timing_str = f"record {timings['record']:.1f}s, total {total_rec_time:.1f}s"
+
+                        if effective_metrics_level == "minimal":
+                            result = (
+                                f"[listening...] {partial_transcript}\n"
+                                f"> session_id: {new_session_id} | status: listening"
+                            )
+                        else:
+                            result = (
+                                f"[listening...] {partial_transcript}\n"
+                                f"> session_id: {new_session_id} | recorded: {total_rec_time:.0f}s | "
+                                f"segments: {len(all_segments)} | status: listening | {timing_str}"
+                            )
+                        logger.info(f"Continuous listen: returning partial result with session {new_session_id}")
+                        return result
+
+                    # Normal completion (end phrase, max duration, or silence)
+                    full_transcript = " ".join(all_segments) if all_segments else None
+                    response_text = full_transcript
+                    timings['stt'] = 0.0  # STT already done incrementally
+
+                    # Log conversation
+                    try:
+                        conversation_logger = get_conversation_logger()
+                        stt_config = await get_stt_config()
+                        rec_timing = f"record {timings['record']:.1f}s"
+                        conversation_logger.log_stt(
+                            text=response_text if response_text else "[no speech detected]",
+                            model=stt_config.get('model', 'whisper-1'),
+                            provider=stt_config.get('provider', 'openai'),
+                            provider_url=stt_config.get('base_url'),
+                            provider_type=stt_config.get('provider_type'),
+                            audio_format='mp3',
+                            transport=transport,
+                            timing=rec_timing,
+                            silence_detection={
+                                "enabled": True,
+                                "vad_aggressiveness": VAD_AGGRESSIVENESS,
+                                "silence_threshold_ms": SILENCE_THRESHOLD_MS,
+                                "listen_mode": "continuous",
+                                "ended_by": ended_by,
+                            },
+                            transcription_time=timings.get('stt'),
+                            total_turnaround_time=None,
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to log STT to JSONL: {e}")
+
+                    # Calculate timing
+                    main_timings = {k: v for k, v in timings.items() if k in ['tts_total', 'record']}
+                    total_time = sum(main_timings.values())
+
+                    tts_timing_parts = []
+                    if 'ttfa' in timings:
+                        tts_timing_parts.append(f"ttfa {timings['ttfa']:.1f}s")
+                    if 'tts_gen' in timings:
+                        tts_timing_parts.append(f"gen {timings['tts_gen']:.1f}s")
+                    if 'tts_play' in timings:
+                        tts_timing_parts.append(f"play {timings['tts_play']:.1f}s")
+
+                    timing_str = ", ".join(tts_timing_parts) if tts_timing_parts else ""
+                    if timing_str:
+                        timing_str += f", record {timings['record']:.1f}s, total {total_time:.1f}s"
+                    else:
+                        timing_str = f"record {timings['record']:.1f}s, total {total_time:.1f}s"
+
+                    ended_info = f" (ended by: {ended_by})"
+
+                    # Track statistics
+                    actual_response = response_text or "[no speech detected]"
+                    track_voice_interaction(
+                        message=message,
+                        response=actual_response,
+                        timing_str=timing_str,
+                        transport=transport,
+                        voice_provider=tts_provider,
+                        voice_name=voice,
+                        model=tts_model,
+                        success=bool(response_text),
+                        error_message=None if response_text else "No speech detected"
+                    )
+
+                    if event_logger and session_id:
+                        event_logger.end_session()
+
+                    if response_text:
+                        if SAVE_TRANSCRIPTIONS:
+                            conversation_text = f"Assistant: {message}\n\nUser: {response_text}"
+                            metadata = {
+                                "type": "conversation",
+                                "transport": transport,
+                                "listen_mode": "continuous",
+                                "ended_by": ended_by,
+                                "segments": len(all_segments),
+                                "voice": voice,
+                                "model": tts_model,
+                                "timing": timing_str,
+                                "timestamp": datetime.now().isoformat()
+                            }
+                            save_transcription(conversation_text, prefix="conversation", metadata=metadata)
+
+                        if effective_metrics_level == "minimal":
+                            result = f"Voice response: {response_text}"
+                        elif effective_metrics_level == "verbose":
+                            result = (
+                                f"Voice response: {response_text} | "
+                                f"Timing: {timing_str} | "
+                                f"Mode: continuous | Segments: {len(all_segments)}{ended_info}"
+                            )
+                        else:
+                            result = f"Voice response: {response_text} | Timing: {timing_str}{ended_info}"
+                        success = True
+                    else:
+                        if effective_metrics_level == "minimal":
+                            result = "No speech detected"
+                        else:
+                            result = f"No speech detected | Timing: {timing_str} | Mode: continuous{ended_info}"
+                        success = True
+
+                    return result
+
+                # ==================== AUTO (DEFAULT) LISTEN MODE ====================
                 # Brief pause before listening
                 await asyncio.sleep(0.5)
-                
+
                 # Play "listening" feedback sound
                 await play_audio_feedback(
                     "listening",
@@ -1496,7 +2166,7 @@ consult the MCP resources listed above.
                     chime_leading_silence=chime_leading_silence,
                     chime_trailing_silence=chime_trailing_silence
                 )
-                
+
                 # Record response
                 logger.info(f"🎤 Listening for {listen_duration_max} seconds...")
 
